@@ -1,0 +1,84 @@
+name: domains-china
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SING_BOX_PLATFORM: linux-amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Get sing-box version
+        id: sing-box-version
+        shell: pwsh
+        run: |
+          $json = Invoke-RestMethod 'https://api.github.com/repos/SagerNet/sing-box/releases/latest'
+          $tag = $json.tag_name
+          $latestVersion = $tag -replace '^v', ''
+          $assetName = "sing-box-$latestVersion-$env:SING_BOX_PLATFORM.tar.gz"
+          $asset = $json.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+          if ($null -eq $asset) {
+            throw "Unable to find release asset: $assetName"
+          }
+          $assetKey = if ($asset.digest) { $asset.digest } else { $asset.updated_at }
+          $assetKey = $assetKey -replace '[^A-Za-z0-9_.-]', '-'
+          "version=$latestVersion" >> $env:GITHUB_OUTPUT
+          "url=$($asset.browser_download_url)" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "asset_key=$assetKey" >> $env:GITHUB_OUTPUT
+
+      - name: Cache sing-box
+        id: cache-sing-box
+        uses: actions/cache@v6
+        with:
+          path: sing-box-bin/sing-box
+          key: sing-box-${{ env.SING_BOX_PLATFORM }}-${{ steps.sing-box-version.outputs.version }}-${{ steps.sing-box-version.outputs.asset_key }}
+
+      - name: Get sing-box
+        if: steps.cache-sing-box.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          SING_BOX_URL: ${{ steps.sing-box-version.outputs.url }}
+          SING_BOX_ASSET_NAME: ${{ steps.sing-box-version.outputs.asset_name }}
+        run: |
+          New-Item -ItemType Directory -Force -Path sing-box-bin | Out-Null
+          Invoke-WebRequest -Uri $env:SING_BOX_URL -OutFile $env:SING_BOX_ASSET_NAME
+          tar -xzf $env:SING_BOX_ASSET_NAME
+          $archiveName = [System.IO.Path]::GetFileNameWithoutExtension($env:SING_BOX_ASSET_NAME)
+          $extractedDirectory = [System.IO.Path]::GetFileNameWithoutExtension($archiveName)
+          Move-Item -Path (Join-Path $extractedDirectory 'sing-box') -Destination 'sing-box-bin/sing-box' -Force
+          Remove-Item $extractedDirectory -Recurse -Force
+          Remove-Item $env:SING_BOX_ASSET_NAME
+
+      - name: Generate domains.china.json and domains.china.list
+        run: python3 scripts/generate_domains_china.py
+
+      - name: Compile domains.china.srs
+        run: |
+          chmod +x sing-box-bin/sing-box
+          ./sing-box-bin/sing-box rule-set compile --output domains.china.srs domains.china.json
+
+      - name: Publish to rules directory
+        run: |
+          mkdir -p rules
+          mv domains.china.json domains.china.srs domains.china.list rules/
+
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add rules/domains.china.json rules/domains.china.srs rules/domains.china.list
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update domains.china rule-set"
+          git push
